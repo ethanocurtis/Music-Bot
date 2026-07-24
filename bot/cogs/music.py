@@ -65,6 +65,7 @@ class GuildPlayer:
     paused_at: float | None = None
     paused_total: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    starting: bool = False
 
     def position(self) -> int:
         if self.started_at is None:
@@ -104,11 +105,13 @@ class Music(commands.Cog):
 
         tracks: list[Track] = []
         for item in raw_items:
-            url = item.get("webpage_url") or item.get("original_url") or item.get("url")
+            url = item.get("webpage_url") or item.get("original_url") or item.get("url") or item.get("id")
             if not url:
                 continue
-            if item.get("ie_key") == "Youtube" and not str(url).startswith("http"):
-                url = f"https://www.youtube.com/watch?v={url}"
+            extractor = str(item.get("extractor_key") or item.get("ie_key") or "").lower()
+            if "youtube" in extractor and not str(url).startswith("http"):
+                video_id = item.get("id") or url
+                url = f"https://www.youtube.com/watch?v={video_id}"
             tracks.append(
                 Track(
                     title=item.get("title") or "Unknown title",
@@ -157,53 +160,104 @@ class Music(commands.Cog):
                 return None
             return voice
         try:
-            voice = await channel.connect(self_deaf=True)
+            voice = await channel.connect(self_deaf=False)
         except Exception:
             log.exception("Failed to connect to voice in guild %s", interaction.guild.id)
             await send("I could not connect to that voice channel. Check my Connect and Speak permissions.", ephemeral=True)
             return None
+        # Discord can return from connect() just before the voice transport is
+        # fully usable. Wait briefly so the first /play works reliably instead
+        # of requiring a second command.
+        for _ in range(40):
+            if voice.is_connected():
+                break
+            await asyncio.sleep(0.25)
+        else:
+            log.error("Voice connection did not become ready in guild %s", interaction.guild.id)
+            try:
+                await voice.disconnect(force=True)
+            except Exception:
+                pass
+            await send("I joined voice, but the connection did not become ready. Please try again.", ephemeral=True)
+            return None
+
+        # Give Discord's voice websocket/UDP handshake one final moment to settle
+        # before FFmpeg is started for the first track.
+        await asyncio.sleep(0.35)
+
         guild_settings = await self.settings.get(interaction.guild.id)
         self.state(interaction.guild.id).volume = guild_settings.default_volume
         return voice
 
+    async def wait_for_voice_ready(self, guild: discord.Guild, timeout: float = 10.0) -> discord.VoiceClient | None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            voice = guild.voice_client
+            if isinstance(voice, discord.VoiceClient) and voice.is_connected():
+                return voice
+            await asyncio.sleep(0.25)
+        return None
+
     async def play_next(self, guild: discord.Guild) -> None:
         state = self.state(guild.id)
+
+        # Only one queue starter may run at a time. Do not hold this lock while
+        # yt-dlp resolves a stream because playlist entries can take a moment.
         async with state.lock:
+            if state.starting:
+                return
             voice = guild.voice_client
-            if not isinstance(voice, discord.VoiceClient) or not voice.is_connected() or voice.is_playing() or voice.is_paused():
+            if isinstance(voice, discord.VoiceClient) and (voice.is_playing() or voice.is_paused()):
                 return
-            if not state.queue:
-                state.current = None
-                state.started_at = None
+            state.starting = True
+
+        try:
+            voice = await self.wait_for_voice_ready(guild)
+            if not isinstance(voice, discord.VoiceClient):
+                log.warning("Voice was not ready when attempting playback in guild %s", guild.id)
                 return
-            track = state.queue.popleft()
-            state.current = track
-            state.started_at = time.monotonic()
-            state.paused_at = None
-            state.paused_total = 0.0
-            try:
-                stream_url, headers = await self.resolve_stream(track)
-                header_args = "".join(f"{k}: {v}\\r\\n" for k, v in headers.items())
-                before = FFMPEG_BEFORE + (f' -headers "{header_args}"' if header_args else "")
-                source = discord.FFmpegPCMAudio(stream_url, before_options=before, options=FFMPEG_OPTIONS)
-                audio = discord.PCMVolumeTransformer(source, volume=state.volume / 100)
 
-                def after(error: Exception | None) -> None:
-                    if error:
-                        log.error("FFmpeg playback error in guild %s: %s", guild.id, error)
-                    future = asyncio.run_coroutine_threadsafe(self._after_track(guild, error), self.bot.loop)
-                    try:
-                        future.result()
-                    except Exception:
-                        log.exception("Failed to advance queue in guild %s", guild.id)
+            # Skip unavailable playlist entries instead of leaving the whole
+            # playlist queued but idle.
+            while True:
+                async with state.lock:
+                    if not state.queue:
+                        state.current = None
+                        state.started_at = None
+                        return
+                    track = state.queue.popleft()
 
-                voice.play(audio, after=after)
-                log.info("Started track %r in guild %s", track.title, guild.id)
-            except Exception:
-                log.exception("Failed to resolve or start %r in guild %s", track.title, guild.id)
-                state.current = None
-                state.started_at = None
-                asyncio.create_task(self.play_next(guild))
+                try:
+                    stream_url, headers = await self.resolve_stream(track)
+                    header_args = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+                    before = FFMPEG_BEFORE + (f' -headers "{header_args}"' if header_args else "")
+                    source = discord.FFmpegPCMAudio(stream_url, before_options=before, options=FFMPEG_OPTIONS)
+                    audio = discord.PCMVolumeTransformer(source, volume=state.volume / 100)
+
+                    def after(error: Exception | None) -> None:
+                        if error:
+                            log.error("FFmpeg playback error in guild %s: %s", guild.id, error)
+                        future = asyncio.run_coroutine_threadsafe(self._after_track(guild, error), self.bot.loop)
+                        try:
+                            future.result()
+                        except Exception:
+                            log.exception("Failed to advance queue in guild %s", guild.id)
+
+                    voice.play(audio, after=after)
+                    state.current = track
+                    state.started_at = time.monotonic()
+                    state.paused_at = None
+                    state.paused_total = 0.0
+                    log.info("Started track %r in guild %s", track.title, guild.id)
+                    return
+                except Exception:
+                    log.exception("Failed to resolve or start %r in guild %s; trying next queued track", track.title, guild.id)
+                    state.current = None
+                    state.started_at = None
+                    continue
+        finally:
+            async with state.lock:
+                state.starting = False
 
     async def _after_track(self, guild: discord.Guild, error: Exception | None) -> None:
         state = self.state(guild.id)
