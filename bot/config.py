@@ -18,8 +18,6 @@ def _int(name: str, default: int | None = None) -> int | None:
 @dataclass(frozen=True, slots=True)
 class Settings:
     discord_token: str
-    lavalink_uri: str
-    lavalink_password: str
     database_url: str
     default_volume: int
     inactivity_timeout_seconds: int
@@ -32,8 +30,6 @@ class Settings:
             raise RuntimeError("DISCORD_TOKEN is missing from .env")
         return cls(
             discord_token=token,
-            lavalink_uri=os.getenv("LAVALINK_URI", "http://lavalink:2333"),
-            lavalink_password=os.getenv("LAVALINK_PASSWORD", "change-me"),
             database_url=os.getenv("DATABASE_URL", "sqlite+aiosqlite:////app/data/musicbot.db"),
             default_volume=max(0, min(150, int(os.getenv("DEFAULT_VOLUME", "75")))),
             inactivity_timeout_seconds=max(60, int(os.getenv("INACTIVITY_TIMEOUT_SECONDS", "300"))),

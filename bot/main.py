@@ -5,7 +5,6 @@ import logging
 
 import discord
 from discord.ext import commands
-import wavelink
 
 from .config import Settings
 from .db.session import Database
@@ -27,8 +26,6 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.database.initialize()
-        node = wavelink.Node(uri=self.settings.lavalink_uri, password=self.settings.lavalink_password)
-        await wavelink.Pool.connect(nodes=[node], client=self)
         await self.load_extension("bot.cogs.music")
         await self.load_extension("bot.cogs.admin")
         self.add_view(PlayerControls())
@@ -42,6 +39,9 @@ class MusicBot(commands.Bot):
             log.info("Synced %s global commands", len(synced))
 
     async def close(self) -> None:
+        cog = self.get_cog("Music")
+        if cog and hasattr(cog, "shutdown"):
+            await cog.shutdown()
         await self.database.close()
         await super().close()
 
