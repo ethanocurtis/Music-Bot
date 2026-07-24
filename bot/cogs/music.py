@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 
 import discord
@@ -9,6 +10,9 @@ import wavelink
 
 from bot.services.settings import GuildSettingsService
 from bot.views import PlayerControls
+
+
+log = logging.getLogger("musicbot.music")
 
 
 def format_ms(value: int) -> str:
@@ -58,17 +62,46 @@ class Music(commands.Cog):
         if not results:
             await interaction.followup.send("No matching tracks were found.", ephemeral=True)
             return
-        tracks = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results)
+        # Search responses contain multiple choices. Queue only the best match.
+        # Actual playlist URLs return wavelink.Playlist and should queue every track.
+        if isinstance(results, wavelink.Playlist):
+            tracks = list(results.tracks)
+            playlist_name = results.name
+        else:
+            tracks = [results[0]]
+            playlist_name = None
+
         if not tracks:
-            await interaction.followup.send("That playlist did not contain playable tracks.", ephemeral=True)
+            await interaction.followup.send("No playable tracks were returned.", ephemeral=True)
             return
+
         for track in tracks:
-            track.extras = {"requester_id": interaction.user.id, "requester_name": interaction.user.display_name}
-        added = await player.queue.put_wait(tracks)
-        if not player.playing:
-            await player.play(player.queue.get())
+            track.extras = {
+                "requester_id": interaction.user.id,
+                "requester_name": interaction.user.display_name,
+            }
+
+        # Put tracks into the queue, then start the first queued item when idle.
+        await player.queue.put_wait(tracks)
+        if player.current is None:
+            try:
+                next_track = player.queue.get()
+                await player.play(next_track)
+            except Exception:
+                log.exception("Failed to start playback in guild %s", interaction.guild.id)
+                await interaction.followup.send(
+                    "I found the track but Lavalink could not start playback. "
+                    "Check `docker compose logs -f bot lavalink` for the exact source error.",
+                    ephemeral=True,
+                )
+                return
+
         first = tracks[0]
-        text = f"Queued **{first.title}**" if len(tracks) == 1 else f"Queued **{len(tracks)} tracks** from **{getattr(results, 'name', first.title)}**"
+        text = (
+            f"Queued **{first.title}**"
+            if playlist_name is None
+            else f"Queued **{len(tracks)} tracks** from **{playlist_name}**"
+        )
         await interaction.followup.send(text, view=PlayerControls())
 
     async def ensure_player_deferred(self, interaction: discord.Interaction) -> wavelink.Player | None:
@@ -189,10 +222,36 @@ class Music(commands.Cog):
         await interaction.response.send_message("Disconnected.")
 
     @commands.Cog.listener()
+    async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload) -> None:
+        log.info(
+            "Started track %r in guild %s",
+            payload.track.title,
+            payload.player.guild.id if payload.player else "unknown",
+        )
+
+    @commands.Cog.listener()
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload) -> None:
         player = payload.player
         if player and not player.queue.is_empty:
-            await player.play(player.queue.get())
+            try:
+                await player.play(player.queue.get())
+            except Exception:
+                log.exception("Failed to advance the queue in guild %s", player.guild.id)
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload) -> None:
+        player = payload.player
+        log.error(
+            "Track exception in guild %s for %r: %s",
+            player.guild.id if player else "unknown",
+            payload.track.title,
+            payload.exception,
+        )
+        if player and not player.queue.is_empty:
+            try:
+                await player.play(player.queue.get())
+            except Exception:
+                log.exception("Failed to continue after a track exception")
 
 
 async def setup(bot: commands.Bot) -> None:
