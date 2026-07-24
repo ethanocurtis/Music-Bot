@@ -1,5 +1,5 @@
 discord.py[voice]>=2.5,<3.0
-yt-dlp>=2026.7.16
+yt-dlp>=2026.7.4
 SQLAlchemy>=2.0,<3.0
 aiosqlite>=0.20,<1.0
 python-dotenv>=1.0,<2.0
