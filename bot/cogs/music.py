@@ -41,7 +41,7 @@ class Music(commands.Cog):
                 await interaction.response.send_message("You must be in my voice channel.", ephemeral=True)
                 return None
             return player
-        player = await interaction.user.voice.channel.connect(cls=wavelink.Player, self_deaf=True)
+        player = await interaction.user.voice.channel.connect(cls=wavelink.Player, self_deaf=False)
         guild_settings = await self.settings.get(interaction.guild.id)
         await player.set_volume(guild_settings.default_volume)
         return player
@@ -53,7 +53,7 @@ class Music(commands.Cog):
         player = await self.ensure_player_deferred(interaction)
         if not player:
             return
-        search_query = query if query.startswith(("http://", "https://")) else f"ytmsearch:{query}"
+        search_query = query if query.startswith(("http://", "https://")) else f"ytsearch:{query}"
         try:
             results = await wavelink.Playable.search(search_query)
         except Exception as exc:
@@ -117,7 +117,7 @@ class Music(commands.Cog):
                 await interaction.followup.send("You must be in my voice channel.", ephemeral=True)
                 return None
             return player
-        player = await interaction.user.voice.channel.connect(cls=wavelink.Player, self_deaf=True)
+        player = await interaction.user.voice.channel.connect(cls=wavelink.Player, self_deaf=False)
         guild_settings = await self.settings.get(interaction.guild.id)
         await player.set_volume(guild_settings.default_volume)
         return player
